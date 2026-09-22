@@ -1,0 +1,17 @@
+# STM32CubeIDE build outputs
+Debug/
+Release/
+build_*/
+
+# Generated linker and binary artifacts; the released HEX is explicitly kept.
+*.elf
+*.map
+*.list
+*.bin
+*.hex
+!firmware/*.hex
+
+# Local tooling
+.idea/
+.vscode/
+*.log
