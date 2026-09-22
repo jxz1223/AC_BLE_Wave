@@ -16,10 +16,11 @@
 #define ADC_NOMINAL_CENTER             2048U
 #define AGC_MAX_CODE                     7U
 #define AGC_WINDOW_FRAMES                13U
-#define AGC_SETTLE_FRAMES                 3U
-#define AGC_REDUCE_NEGATIVE_PEAK      1434U
-#define AGC_REDUCE_POSITIVE_PEAK      1433U
-#define AGC_RAISE_PEAK                1024U
+#define AGC_CONFIRM_WINDOWS              3U
+#define AGC_HOLDOFF_FRAMES              53U
+#define AGC_REDUCE_NEGATIVE_PEAK      1600U
+#define AGC_REDUCE_POSITIVE_PEAK      1600U
+#define AGC_RAISE_PEAK                 600U
 #define NORMALIZED_CENTER ((uint32_t)ADC_NOMINAL_CENTER * (1UL << AGC_MAX_CODE))
 #define NORMALIZED_MAX                 0x7FFFFUL
 
@@ -51,12 +52,15 @@ static uint16_t adc_center[ADC_CHANNEL_COUNT] = {
 };
 static uint16_t agc_min[ADC_CHANNEL_COUNT];
 static uint16_t agc_max[ADC_CHANNEL_COUNT];
-static uint8_t agc_window_count = 0U;
-static uint8_t agc_settle_count = AGC_SETTLE_FRAMES;
+static uint8_t agc_window_count[ADC_CHANNEL_COUNT];
+static uint8_t agc_high_confirm[ADC_CHANNEL_COUNT];
+static uint8_t agc_low_confirm[ADC_CHANNEL_COUNT];
+static uint8_t agc_holdoff_count[ADC_CHANNEL_COUNT];
 
 static void Sensor_App_Process(void);
 static void Set_Gain(uint8_t channel, uint8_t code);
 static void Reset_Agc_Stats(void);
+static void Reset_Agc_Channel_Stats(uint8_t channel);
 static void Observe_Agc_Block(const volatile uint16_t *samples);
 static uint16_t Crc16(const uint8_t *data, uint16_t length);
 static uint32_t Normalize_Adc(uint16_t raw_adc, uint8_t channel);
@@ -310,12 +314,21 @@ static void Set_Gain(uint8_t channel, uint8_t code)
 static void Reset_Agc_Stats(void)
 {
   uint8_t channel;
+
   for (channel = 0U; channel < ADC_CHANNEL_COUNT; channel++)
   {
-    agc_min[channel] = 0x0FFFU;
-    agc_max[channel] = 0U;
+    Reset_Agc_Channel_Stats(channel);
+    agc_high_confirm[channel] = 0U;
+    agc_low_confirm[channel] = 0U;
+    agc_holdoff_count[channel] = 0U;
   }
-  agc_window_count = 0U;
+}
+
+static void Reset_Agc_Channel_Stats(uint8_t channel)
+{
+  agc_min[channel] = 0x0FFFU;
+  agc_max[channel] = 0U;
+  agc_window_count[channel] = 0U;
 }
 
 static void Observe_Agc_Block(const volatile uint16_t *samples)
@@ -323,45 +336,88 @@ static void Observe_Agc_Block(const volatile uint16_t *samples)
   uint32_t i;
   uint8_t channel;
 
-  if (agc_settle_count != 0U)
+  for (channel = 0U; channel < ADC_CHANNEL_COUNT; channel++)
   {
-    agc_settle_count--;
-    Reset_Agc_Stats();
-    return;
+    if (agc_holdoff_count[channel] != 0U)
+    {
+      agc_holdoff_count[channel]--;
+      if (agc_holdoff_count[channel] == 0U)
+      {
+        Reset_Agc_Channel_Stats(channel);
+      }
+    }
   }
+
   for (i = 0U; i < ADC_CONVERTED_DATA_BUFFER_SIZE; i++)
   {
     channel = (uint8_t)(i % ADC_CHANNEL_COUNT);
+    if (agc_holdoff_count[channel] != 0U)
+    {
+      continue;
+    }
     if (samples[i] < agc_min[channel]) agc_min[channel] = samples[i];
     if (samples[i] > agc_max[channel]) agc_max[channel] = samples[i];
   }
-  agc_window_count++;
-  if (agc_window_count < AGC_WINDOW_FRAMES)
-  {
-    return;
-  }
+
   for (channel = 0U; channel < ADC_CHANNEL_COUNT; channel++)
   {
-    uint8_t next = gain_code[channel];
+    uint8_t high_limit_exceeded;
+    uint8_t low_limit_exceeded;
+
+    if (agc_holdoff_count[channel] != 0U)
+    {
+      continue;
+    }
+
+    agc_window_count[channel]++;
+    if (agc_window_count[channel] < AGC_WINDOW_FRAMES)
+    {
+      continue;
+    }
+
+    {
     int32_t negative_peak = (int32_t)adc_center[channel] - (int32_t)agc_min[channel];
     int32_t positive_peak = (int32_t)agc_max[channel] - (int32_t)adc_center[channel];
+      high_limit_exceeded = ((negative_peak > (int32_t)AGC_REDUCE_NEGATIVE_PEAK) ||
+                             (positive_peak > (int32_t)AGC_REDUCE_POSITIVE_PEAK)) ? 1U : 0U;
+      low_limit_exceeded = ((negative_peak < (int32_t)AGC_RAISE_PEAK) &&
+                            (positive_peak < (int32_t)AGC_RAISE_PEAK)) ? 1U : 0U;
+    }
 
-    if (((negative_peak > (int32_t)AGC_REDUCE_NEGATIVE_PEAK) ||
-         (positive_peak > (int32_t)AGC_REDUCE_POSITIVE_PEAK)) && (next > 0U))
+    if (high_limit_exceeded != 0U)
     {
-      next--;
+      agc_low_confirm[channel] = 0U;
+      if (agc_high_confirm[channel] < AGC_CONFIRM_WINDOWS)
+      {
+        agc_high_confirm[channel]++;
+      }
+      if ((agc_high_confirm[channel] >= AGC_CONFIRM_WINDOWS) && (gain_code[channel] > 0U))
+      {
+        Set_Gain(channel, (uint8_t)(gain_code[channel] - 1U));
+        agc_high_confirm[channel] = 0U;
+        agc_holdoff_count[channel] = AGC_HOLDOFF_FRAMES;
+      }
     }
-    else if ((negative_peak < (int32_t)AGC_RAISE_PEAK) &&
-             (positive_peak < (int32_t)AGC_RAISE_PEAK) &&
-             (next < AGC_MAX_CODE))
+    else if (low_limit_exceeded != 0U)
     {
-      next++;
+      agc_high_confirm[channel] = 0U;
+      if (agc_low_confirm[channel] < AGC_CONFIRM_WINDOWS)
+      {
+        agc_low_confirm[channel]++;
+      }
+      if ((agc_low_confirm[channel] >= AGC_CONFIRM_WINDOWS) && (gain_code[channel] < AGC_MAX_CODE))
+      {
+        Set_Gain(channel, (uint8_t)(gain_code[channel] + 1U));
+        agc_low_confirm[channel] = 0U;
+        agc_holdoff_count[channel] = AGC_HOLDOFF_FRAMES;
+      }
     }
-    if (next != gain_code[channel])
+    else
     {
-      Set_Gain(channel, next);
-      agc_settle_count = AGC_SETTLE_FRAMES;
+      agc_high_confirm[channel] = 0U;
+      agc_low_confirm[channel] = 0U;
     }
+
+    Reset_Agc_Channel_Stats(channel);
   }
-  Reset_Agc_Stats();
 }
